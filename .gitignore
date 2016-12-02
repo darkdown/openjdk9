@@ -9,5 +9,5 @@ webrev
 .DS_Store
 .metadata/
 .recommenders/
+!hgrc
 .hg/
-!.hg/hgrc

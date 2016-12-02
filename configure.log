@@ -1,0 +1,3 @@
+/mnt/hdd/win_d/source/myself/darkdown/openjdk9/common/autoconf/generated-configure.sh: line 22: $'\r': command not found
+/mnt/hdd/win_d/source/myself/darkdown/openjdk9/common/autoconf/generated-configure.sh: line 37: syntax error near unexpected token `newline'
+/mnt/hdd/win_d/source/myself/darkdown/openjdk9/common/autoconf/generated-configure.sh: line 37: `     ;;'
