@@ -24,12 +24,12 @@
 /*
  * @test
  * @bug 8152341
- * @requires (vm.simpleArch == "x64" | vm.simpleArch == "sparcv9" | vm.simpleArch == "aarch64")
+ * @requires vm.jvmci
  * @library /test/lib /compiler/jvmci/jdk.vm.ci.hotspot.test/src
- * @modules jdk.vm.ci/jdk.vm.ci.meta
- *          jdk.vm.ci/jdk.vm.ci.common
- *          jdk.vm.ci/jdk.vm.ci.runtime
- *          jdk.vm.ci/jdk.vm.ci.hotspot
+ * @modules jdk.internal.vm.ci/jdk.vm.ci.meta
+ *          jdk.internal.vm.ci/jdk.vm.ci.common
+ *          jdk.internal.vm.ci/jdk.vm.ci.runtime
+ *          jdk.internal.vm.ci/jdk.vm.ci.hotspot
  *          java.base/jdk.internal.misc
  * @run testng/othervm -XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI
  *      jdk.vm.ci.hotspot.test.MemoryAccessProviderTest

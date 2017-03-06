@@ -282,7 +282,7 @@ int SharedRuntime::java_calling_convention(const BasicType *sig_bt,
       regs[i].set_bad();
       break;
     case T_LONG:
-      assert(sig_bt[i + 1] == T_VOID, "expecting half");
+      assert((i + 1) < total_args_passed && sig_bt[i + 1] == T_VOID, "expecting half");
       // fall through
     case T_OBJECT:
     case T_ARRAY:
@@ -303,7 +303,7 @@ int SharedRuntime::java_calling_convention(const BasicType *sig_bt,
       }
       break;
     case T_DOUBLE:
-      assert(sig_bt[i + 1] == T_VOID, "expecting half");
+      assert((i + 1) < total_args_passed && sig_bt[i + 1] == T_VOID, "expecting half");
       if (fp_args < Argument::n_float_register_parameters_j) {
         regs[i].set2(FP_ArgReg[fp_args++]->as_VMReg());
       } else {
@@ -840,7 +840,7 @@ int SharedRuntime::c_calling_convention(const BasicType *sig_bt,
         }
         break;
       case T_LONG:
-        assert(sig_bt[i + 1] == T_VOID, "expecting half");
+        assert((i + 1) < total_args_passed && sig_bt[i + 1] == T_VOID, "expecting half");
         // fall through
       case T_OBJECT:
       case T_ARRAY:
@@ -862,7 +862,7 @@ int SharedRuntime::c_calling_convention(const BasicType *sig_bt,
         }
         break;
       case T_DOUBLE:
-        assert(sig_bt[i + 1] == T_VOID, "expecting half");
+        assert((i + 1) < total_args_passed && sig_bt[i + 1] == T_VOID, "expecting half");
         if (fp_args < Argument::n_float_register_parameters_c) {
           regs[i].set2(FP_ArgReg[fp_args++]->as_VMReg());
         } else {
@@ -2388,6 +2388,7 @@ void SharedRuntime::generate_deopt_blob() {
 
     __ movw(rcpool, (int32_t)Deoptimization::Unpack_reexecute);
     __ mov(c_rarg0, rthread);
+    __ movw(c_rarg2, rcpool); // exec mode
     __ lea(rscratch1,
            RuntimeAddress(CAST_FROM_FN_PTR(address,
                                            Deoptimization::uncommon_trap)));

@@ -657,14 +657,13 @@ public:
           range(0, 99)                                                      \
                                                                             \
   product(bool, UseAES, false,                                              \
-          "Control whether AES instructions can be used on x86/x64")        \
+          "Control whether AES instructions are used when available")       \
                                                                             \
   product(bool, UseFMA, false,                                              \
-          "Control whether FMA instructions can be used")                   \
+          "Control whether FMA instructions are used when available")       \
                                                                             \
   product(bool, UseSHA, false,                                              \
-          "Control whether SHA instructions can be used "                   \
-          "on SPARC, on ARM and on x86")                                    \
+          "Control whether SHA instructions are used when available")       \
                                                                             \
   diagnostic(bool, UseGHASHIntrinsics, false,                               \
           "Use intrinsics for GHASH versions of crypto")                    \
@@ -1988,7 +1987,7 @@ public:
   experimental(uintx, WorkStealingSpinToYieldRatio, 10,                     \
           "Ratio of hard spins to calls to yield")                          \
                                                                             \
-  develop(uintx, ObjArrayMarkingStride, 512,                                \
+  develop(uintx, ObjArrayMarkingStride, 2048,                               \
           "Number of object array elements to push onto the marking stack " \
           "before pushing a continuation entry")                            \
                                                                             \
@@ -2036,6 +2035,10 @@ public:
           "Maximum ergonomically set heap size (in bytes); zero means use " \
           "MaxRAM / MaxRAMFraction")                                        \
           range(0, max_uintx)                                               \
+                                                                            \
+  experimental(bool, UseCGroupMemoryLimitForHeap, false,                    \
+          "Use CGroup memory limit as physical memory limit for heap "      \
+          "sizing")                                                         \
                                                                             \
   product(uintx, MaxRAMFraction, 4,                                         \
           "Maximum fraction (1/n) of real memory used for maximum heap "    \
@@ -3371,7 +3374,7 @@ public:
           "Code cache expansion size (in bytes)")                           \
           range(0, max_uintx)                                               \
                                                                             \
-  develop_pd(uintx, CodeCacheMinBlockLength,                                \
+  diagnostic_pd(uintx, CodeCacheMinBlockLength,                             \
           "Minimum number of segments in a code cache block")               \
           range(1, 100)                                                     \
                                                                             \
@@ -3386,6 +3389,22 @@ public:
           "Segmented code cache: X[%] of the non-profiled heap."            \
           "Non-segmented code cache: X[%] of the total code cache")         \
           range(0, 100)                                                     \
+                                                                            \
+  /* AOT parameters */                                                      \
+  product(bool, UseAOT, AOT_ONLY(true) NOT_AOT(false),                      \
+          "Use AOT compiled files")                                         \
+                                                                            \
+  product(ccstrlist, AOTLibrary, NULL,                                      \
+          "AOT library")                                                    \
+                                                                            \
+  product(bool, PrintAOT, false,                                            \
+          "Print used AOT klasses and methods")                             \
+                                                                            \
+  notproduct(bool, PrintAOTStatistics, false,                               \
+          "Print AOT statistics")                                           \
+                                                                            \
+  diagnostic(bool, UseAOTStrictLoading, false,                              \
+          "Exit the VM if any of the AOT libraries has invalid config")     \
                                                                             \
   /* interpreter debugging */                                               \
   develop(intx, BinarySwitchThreshold, 5,                                   \
@@ -3657,6 +3676,25 @@ public:
                                                                             \
   product(intx, Tier3BackEdgeThreshold,  60000,                             \
           "Back edge threshold at which tier 3 OSR compilation is invoked") \
+          range(0, max_jint)                                                \
+                                                                            \
+  product(intx, Tier3AOTInvocationThreshold, 10000,                         \
+          "Compile if number of method invocations crosses this "           \
+          "threshold if coming from AOT")                                   \
+          range(0, max_jint)                                                \
+                                                                            \
+  product(intx, Tier3AOTMinInvocationThreshold, 1000,                       \
+          "Minimum invocation to compile at tier 3 if coming from AOT")     \
+          range(0, max_jint)                                                \
+                                                                            \
+  product(intx, Tier3AOTCompileThreshold, 15000,                            \
+          "Threshold at which tier 3 compilation is invoked (invocation "   \
+          "minimum must be satisfied) if coming from AOT")                  \
+          range(0, max_jint)                                                \
+                                                                            \
+  product(intx, Tier3AOTBackEdgeThreshold,  120000,                         \
+          "Back edge threshold at which tier 3 OSR compilation is invoked " \
+          "if coming from AOT")                                             \
           range(0, max_jint)                                                \
                                                                             \
   product(intx, Tier4InvocationThreshold, 5000,                             \

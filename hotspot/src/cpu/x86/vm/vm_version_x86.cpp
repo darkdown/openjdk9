@@ -65,6 +65,7 @@ class VM_Version_StubGenerator: public StubCodeGenerator {
     const int      CPU_FAMILY_SHIFT = 8;
     const uint32_t CPU_FAMILY_386 = (3 << CPU_FAMILY_SHIFT);
     const uint32_t CPU_FAMILY_486 = (4 << CPU_FAMILY_SHIFT);
+    bool use_evex = FLAG_IS_DEFAULT(UseAVX) || (UseAVX > 2);
 
     Label detect_486, cpu486, detect_586, std_cpuid1, std_cpuid4;
     Label sef_cpuid, ext_cpuid, ext_cpuid1, ext_cpuid5, ext_cpuid7, done, wrapup;
@@ -358,36 +359,39 @@ class VM_Version_StubGenerator: public StubCodeGenerator {
     __ cmpl(rax, 0xE0);
     __ jccb(Assembler::notEqual, legacy_setup); // jump if EVEX is not supported
 
-    // EVEX setup: run in lowest evex mode
-    VM_Version::set_evex_cpuFeatures(); // Enable temporary to pass asserts
-    UseAVX = 3;
-    UseSSE = 2;
+    // If UseAVX is unitialized or is set by the user to include EVEX
+    if (use_evex) {
+      // EVEX setup: run in lowest evex mode
+      VM_Version::set_evex_cpuFeatures(); // Enable temporary to pass asserts
+      UseAVX = 3;
+      UseSSE = 2;
 #ifdef _WINDOWS
-    // xmm5-xmm15 are not preserved by caller on windows
-    // https://msdn.microsoft.com/en-us/library/9z1stfyw.aspx
-    __ subptr(rsp, 64);
-    __ evmovdqul(Address(rsp, 0), xmm7, Assembler::AVX_512bit);
+      // xmm5-xmm15 are not preserved by caller on windows
+      // https://msdn.microsoft.com/en-us/library/9z1stfyw.aspx
+      __ subptr(rsp, 64);
+      __ evmovdqul(Address(rsp, 0), xmm7, Assembler::AVX_512bit);
 #ifdef _LP64
-    __ subptr(rsp, 64);
-    __ evmovdqul(Address(rsp, 0), xmm8, Assembler::AVX_512bit);
-    __ subptr(rsp, 64);
-    __ evmovdqul(Address(rsp, 0), xmm31, Assembler::AVX_512bit);
+      __ subptr(rsp, 64);
+      __ evmovdqul(Address(rsp, 0), xmm8, Assembler::AVX_512bit);
+      __ subptr(rsp, 64);
+      __ evmovdqul(Address(rsp, 0), xmm31, Assembler::AVX_512bit);
 #endif // _LP64
 #endif // _WINDOWS
 
-    // load value into all 64 bytes of zmm7 register
-    __ movl(rcx, VM_Version::ymm_test_value());
-    __ movdl(xmm0, rcx);
-    __ movl(rcx, 0xffff);
-    __ kmovwl(k1, rcx);
-    __ evpbroadcastd(xmm0, xmm0, Assembler::AVX_512bit);
-    __ evmovdqul(xmm7, xmm0, Assembler::AVX_512bit);
+      // load value into all 64 bytes of zmm7 register
+      __ movl(rcx, VM_Version::ymm_test_value());
+      __ movdl(xmm0, rcx);
+      __ movl(rcx, 0xffff);
+      __ kmovwl(k1, rcx);
+      __ evpbroadcastd(xmm0, xmm0, Assembler::AVX_512bit);
+      __ evmovdqul(xmm7, xmm0, Assembler::AVX_512bit);
 #ifdef _LP64
-    __ evmovdqul(xmm8, xmm0, Assembler::AVX_512bit);
-    __ evmovdqul(xmm31, xmm0, Assembler::AVX_512bit);
+      __ evmovdqul(xmm8, xmm0, Assembler::AVX_512bit);
+      __ evmovdqul(xmm31, xmm0, Assembler::AVX_512bit);
 #endif
-    VM_Version::clean_cpuFeatures();
-    __ jmp(save_restore_except);
+      VM_Version::clean_cpuFeatures();
+      __ jmp(save_restore_except);
+    }
 
     __ bind(legacy_setup);
     // AVX setup
@@ -441,32 +445,35 @@ class VM_Version_StubGenerator: public StubCodeGenerator {
     __ cmpl(rax, 0xE0);
     __ jccb(Assembler::notEqual, legacy_save_restore);
 
-    // EVEX check: run in lowest evex mode
-    VM_Version::set_evex_cpuFeatures(); // Enable temporary to pass asserts
-    UseAVX = 3;
-    UseSSE = 2;
-    __ lea(rsi, Address(rbp, in_bytes(VM_Version::zmm_save_offset())));
-    __ evmovdqul(Address(rsi, 0), xmm0, Assembler::AVX_512bit);
-    __ evmovdqul(Address(rsi, 64), xmm7, Assembler::AVX_512bit);
+    // If UseAVX is unitialized or is set by the user to include EVEX
+    if (use_evex) {
+      // EVEX check: run in lowest evex mode
+      VM_Version::set_evex_cpuFeatures(); // Enable temporary to pass asserts
+      UseAVX = 3;
+      UseSSE = 2;
+      __ lea(rsi, Address(rbp, in_bytes(VM_Version::zmm_save_offset())));
+      __ evmovdqul(Address(rsi, 0), xmm0, Assembler::AVX_512bit);
+      __ evmovdqul(Address(rsi, 64), xmm7, Assembler::AVX_512bit);
 #ifdef _LP64
-    __ evmovdqul(Address(rsi, 128), xmm8, Assembler::AVX_512bit);
-    __ evmovdqul(Address(rsi, 192), xmm31, Assembler::AVX_512bit);
+      __ evmovdqul(Address(rsi, 128), xmm8, Assembler::AVX_512bit);
+      __ evmovdqul(Address(rsi, 192), xmm31, Assembler::AVX_512bit);
 #endif
 
 #ifdef _WINDOWS
 #ifdef _LP64
-    __ evmovdqul(xmm31, Address(rsp, 0), Assembler::AVX_512bit);
-    __ addptr(rsp, 64);
-    __ evmovdqul(xmm8, Address(rsp, 0), Assembler::AVX_512bit);
-    __ addptr(rsp, 64);
+      __ evmovdqul(xmm31, Address(rsp, 0), Assembler::AVX_512bit);
+      __ addptr(rsp, 64);
+      __ evmovdqul(xmm8, Address(rsp, 0), Assembler::AVX_512bit);
+      __ addptr(rsp, 64);
 #endif // _LP64
-    __ evmovdqul(xmm7, Address(rsp, 0), Assembler::AVX_512bit);
-    __ addptr(rsp, 64);
+      __ evmovdqul(xmm7, Address(rsp, 0), Assembler::AVX_512bit);
+      __ addptr(rsp, 64);
 #endif // _WINDOWS
-    VM_Version::clean_cpuFeatures();
-    UseAVX = saved_useavx;
-    UseSSE = saved_usesse;
-    __ jmp(wrapup);
+      VM_Version::clean_cpuFeatures();
+      UseAVX = saved_useavx;
+      UseSSE = saved_usesse;
+      __ jmp(wrapup);
+    }
 
     __ bind(legacy_save_restore);
     // AVX check
@@ -843,6 +850,12 @@ void VM_Version::get_processor_features() {
 
 #if INCLUDE_RTM_OPT
   if (UseRTMLocking) {
+    if (is_client_compilation_mode_vm()) {
+      // Only C2 does RTM locking optimization.
+      // Can't continue because UseRTMLocking affects UseBiasedLocking flag
+      // setting during arguments processing. See use_biased_locking().
+      vm_exit_during_initialization("RTM locking optimization is not supported in emulated client VM");
+    }
     if (is_intel_family_core()) {
       if ((_model == CPU_MODEL_HASWELL_E3) ||
           (_model == CPU_MODEL_HASWELL_E7 && _stepping < 3) ||

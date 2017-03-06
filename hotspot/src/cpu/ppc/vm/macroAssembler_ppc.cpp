@@ -2569,7 +2569,7 @@ void MacroAssembler::rtm_retry_lock_on_abort(Register retry_count_Reg, Register 
 }
 
 // Spin and retry if lock is busy.
-// inputs: box_Reg (monitor address)
+// inputs: owner_addr_Reg (monitor address)
 //       : retry_count_Reg
 // output: retry_count_Reg decremented by 1
 // CTR is killed
@@ -2577,15 +2577,22 @@ void MacroAssembler::rtm_retry_lock_on_busy(Register retry_count_Reg, Register o
   Label SpinLoop, doneRetry;
   addic_(retry_count_Reg, retry_count_Reg, -1);
   blt(CCR0, doneRetry);
-  li(R0, RTMSpinLoopCount);
-  mtctr(R0);
+
+  if (RTMSpinLoopCount > 1) {
+    li(R0, RTMSpinLoopCount);
+    mtctr(R0);
+  }
 
   bind(SpinLoop);
   smt_yield(); // Can't use waitrsv(). No permission (SIGILL).
-  bdz(retryLabel);
-  ld(R0, 0, owner_addr_Reg);
-  cmpdi(CCR0, R0, 0);
-  bne(CCR0, SpinLoop);
+
+  if (RTMSpinLoopCount > 1) {
+    bdz(retryLabel);
+    ld(R0, 0, owner_addr_Reg);
+    cmpdi(CCR0, R0, 0);
+    bne(CCR0, SpinLoop);
+  }
+
   b(retryLabel);
 
   bind(doneRetry);
@@ -3332,53 +3339,90 @@ void MacroAssembler::load_mirror_from_const_method(Register mirror, Register con
 }
 
 // Clear Array
+// For very short arrays. tmp == R0 is allowed.
+void MacroAssembler::clear_memory_unrolled(Register base_ptr, int cnt_dwords, Register tmp, int offset) {
+  if (cnt_dwords > 0) { li(tmp, 0); }
+  for (int i = 0; i < cnt_dwords; ++i) { std(tmp, offset + i * 8, base_ptr); }
+}
+
+// Version for constant short array length. Kills base_ptr. tmp == R0 is allowed.
+void MacroAssembler::clear_memory_constlen(Register base_ptr, int cnt_dwords, Register tmp) {
+  if (cnt_dwords < 8) {
+    clear_memory_unrolled(base_ptr, cnt_dwords, tmp);
+    return;
+  }
+
+  Label loop;
+  const long loopcnt   = cnt_dwords >> 1,
+             remainder = cnt_dwords & 1;
+
+  li(tmp, loopcnt);
+  mtctr(tmp);
+  li(tmp, 0);
+  bind(loop);
+    std(tmp, 0, base_ptr);
+    std(tmp, 8, base_ptr);
+    addi(base_ptr, base_ptr, 16);
+    bdnz(loop);
+  if (remainder) { std(tmp, 0, base_ptr); }
+}
+
 // Kills both input registers. tmp == R0 is allowed.
-void MacroAssembler::clear_memory_doubleword(Register base_ptr, Register cnt_dwords, Register tmp) {
+void MacroAssembler::clear_memory_doubleword(Register base_ptr, Register cnt_dwords, Register tmp, long const_cnt) {
   // Procedure for large arrays (uses data cache block zero instruction).
     Label startloop, fast, fastloop, small_rest, restloop, done;
     const int cl_size         = VM_Version::L1_data_cache_line_size(),
-              cl_dwords       = cl_size>>3,
+              cl_dwords       = cl_size >> 3,
               cl_dw_addr_bits = exact_log2(cl_dwords),
-              dcbz_min        = 1;                     // Min count of dcbz executions, needs to be >0.
+              dcbz_min        = 1,  // Min count of dcbz executions, needs to be >0.
+              min_cnt         = ((dcbz_min + 1) << cl_dw_addr_bits) - 1;
 
-//2:
-    cmpdi(CCR1, cnt_dwords, ((dcbz_min+1)<<cl_dw_addr_bits)-1); // Big enough? (ensure >=dcbz_min lines included).
-    blt(CCR1, small_rest);                                      // Too small.
-    rldicl_(tmp, base_ptr, 64-3, 64-cl_dw_addr_bits);           // Extract dword offset within first cache line.
-    beq(CCR0, fast);                                            // Already 128byte aligned.
+  if (const_cnt >= 0) {
+    // Constant case.
+    if (const_cnt < min_cnt) {
+      clear_memory_constlen(base_ptr, const_cnt, tmp);
+      return;
+    }
+    load_const_optimized(cnt_dwords, const_cnt, tmp);
+  } else {
+    // cnt_dwords already loaded in register. Need to check size.
+    cmpdi(CCR1, cnt_dwords, min_cnt); // Big enough? (ensure >= dcbz_min lines included).
+    blt(CCR1, small_rest);
+  }
+    rldicl_(tmp, base_ptr, 64-3, 64-cl_dw_addr_bits); // Extract dword offset within first cache line.
+    beq(CCR0, fast);                                  // Already 128byte aligned.
 
     subfic(tmp, tmp, cl_dwords);
     mtctr(tmp);                        // Set ctr to hit 128byte boundary (0<ctr<cl_dwords).
     subf(cnt_dwords, tmp, cnt_dwords); // rest.
     li(tmp, 0);
-//10:
+
   bind(startloop);                     // Clear at the beginning to reach 128byte boundary.
     std(tmp, 0, base_ptr);             // Clear 8byte aligned block.
     addi(base_ptr, base_ptr, 8);
     bdnz(startloop);
-//13:
+
   bind(fast);                                  // Clear 128byte blocks.
     srdi(tmp, cnt_dwords, cl_dw_addr_bits);    // Loop count for 128byte loop (>0).
     andi(cnt_dwords, cnt_dwords, cl_dwords-1); // Rest in dwords.
     mtctr(tmp);                                // Load counter.
-//16:
+
   bind(fastloop);
     dcbz(base_ptr);                    // Clear 128byte aligned block.
     addi(base_ptr, base_ptr, cl_size);
     bdnz(fastloop);
-    if (InsertEndGroupPPC64) { endgroup(); } else { nop(); }
-//20:
+
   bind(small_rest);
     cmpdi(CCR0, cnt_dwords, 0);        // size 0?
     beq(CCR0, done);                   // rest == 0
     li(tmp, 0);
     mtctr(cnt_dwords);                 // Load counter.
-//24:
+
   bind(restloop);                      // Clear rest.
     std(tmp, 0, base_ptr);             // Clear 8byte aligned block.
     addi(base_ptr, base_ptr, 8);
     bdnz(restloop);
-//27:
+
   bind(done);
 }
 

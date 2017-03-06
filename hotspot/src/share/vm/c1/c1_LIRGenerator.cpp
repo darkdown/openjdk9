@@ -1752,8 +1752,10 @@ void LIRGenerator::do_StoreField(StoreField* x) {
   if (x->needs_null_check() &&
       (needs_patching ||
        MacroAssembler::needs_explicit_null_check(x->offset()))) {
-    // emit an explicit null check because the offset is too large
-    __ null_check(object.result(), new CodeEmitInfo(info));
+    // Emit an explicit null check because the offset is too large.
+    // If the class is not loaded and the object is NULL, we need to deoptimize to throw a
+    // NoClassDefFoundError in the interpreter instead of an implicit NPE from compiled code.
+    __ null_check(object.result(), new CodeEmitInfo(info), /* deoptimize */ needs_patching);
   }
 
   LIR_Address* address;
@@ -1838,8 +1840,10 @@ void LIRGenerator::do_LoadField(LoadField* x) {
       obj = new_register(T_OBJECT);
       __ move(LIR_OprFact::oopConst(NULL), obj);
     }
-    // emit an explicit null check because the offset is too large
-    __ null_check(obj, new CodeEmitInfo(info));
+    // Emit an explicit null check because the offset is too large.
+    // If the class is not loaded and the object is NULL, we need to deoptimize to throw a
+    // NoClassDefFoundError in the interpreter instead of an implicit NPE from compiled code.
+    __ null_check(obj, new CodeEmitInfo(info), /* deoptimize */ needs_patching);
   }
 
   LIR_Opr reg = rlock_result(x, field_type);
@@ -2976,7 +2980,6 @@ void LIRGenerator::do_Invoke(Invoke* x) {
   }
 
   // emit invoke code
-  bool optimized = x->target_is_loaded() && x->target_is_final();
   assert(receiver->is_illegal() || receiver->is_equal(LIR_Assembler::receiverOpr()), "must match");
 
   // JSR 292
@@ -3001,9 +3004,9 @@ void LIRGenerator::do_Invoke(Invoke* x) {
     case Bytecodes::_invokespecial:
     case Bytecodes::_invokevirtual:
     case Bytecodes::_invokeinterface:
-      // for final target we still produce an inline cache, in order
-      // to be able to call mixed mode
-      if (x->code() == Bytecodes::_invokespecial || optimized) {
+      // for loaded and final (method or class) target we still produce an inline cache,
+      // in order to be able to call mixed mode
+      if (x->code() == Bytecodes::_invokespecial || x->target_is_final()) {
         __ call_opt_virtual(target, receiver, result_register,
                             SharedRuntime::get_resolve_opt_virtual_call_stub(),
                             arg_list, info);

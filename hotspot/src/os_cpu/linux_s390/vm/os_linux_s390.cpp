@@ -144,6 +144,42 @@ frame os::fetch_frame_from_context(const void* ucVoid) {
   return frame(sp, epc.pc());
 }
 
+bool os::Linux::get_frame_at_stack_banging_point(JavaThread* thread, ucontext_t* uc, frame* fr) {
+  address pc = (address) os::Linux::ucontext_get_pc(uc);
+  if (Interpreter::contains(pc)) {
+    // Interpreter performs stack banging after the fixed frame header has
+    // been generated while the compilers perform it before. To maintain
+    // semantic consistency between interpreted and compiled frames, the
+    // method returns the Java sender of the current frame.
+    *fr = os::fetch_frame_from_context(uc);
+    if (!fr->is_first_java_frame()) {
+      assert(fr->safe_for_sender(thread), "Safety check");
+      *fr = fr->java_sender();
+    }
+  } else {
+    // More complex code with compiled code.
+    assert(!Interpreter::contains(pc), "Interpreted methods should have been handled above");
+    CodeBlob* cb = CodeCache::find_blob(pc);
+    if (cb == NULL || !cb->is_nmethod() || cb->is_frame_complete_at(pc)) {
+      // Not sure where the pc points to, fallback to default
+      // stack overflow handling. In compiled code, we bang before
+      // the frame is complete.
+      return false;
+    } else {
+      intptr_t* fp = os::Linux::ucontext_get_fp(uc);
+      intptr_t* sp = os::Linux::ucontext_get_sp(uc);
+      *fr = frame(sp, (address)*sp);
+      if (!fr->is_java_frame()) {
+        assert(fr->safe_for_sender(thread), "Safety check");
+        assert(!fr->is_first_frame(), "Safety check");
+        *fr = fr->java_sender();
+      }
+    }
+  }
+  assert(fr->is_java_frame(), "Safety check");
+  return true;
+}
+
 frame os::get_sender_for_C_frame(frame* fr) {
   if (*fr->sp() == 0) {
     // fr is the last C frame.
@@ -171,6 +207,8 @@ frame os::get_sender_for_C_frame(frame* fr) {
 }
 
 frame os::current_frame() {
+  // Expected to return the stack pointer of this method.
+  // But if inlined, returns the stack pointer of our caller!
   intptr_t* csp = (intptr_t*) *((intptr_t*) os::current_stack_pointer());
   assert (csp != NULL, "sp should not be NULL");
   // Pass a dummy pc. This way we don't have to load it from the
@@ -184,8 +222,13 @@ frame os::current_frame() {
     assert(senderFrame.pc() != NULL, "Sender pc should not be NULL");
     // Return sender of sender of current topframe which hopefully
     // both have pc != NULL.
+#ifdef _NMT_NOINLINE_   // Is set in slowdebug builds.
+    // Current_stack_pointer is not inlined, we must pop one more frame.
     frame tmp = os::get_sender_for_C_frame(&topframe);
     return os::get_sender_for_C_frame(&tmp);
+#else
+    return os::get_sender_for_C_frame(&topframe);
+#endif
   }
 }
 
@@ -272,13 +315,31 @@ JVM_handle_linux_signal(int sig,
       if (thread->on_local_stack(addr)) {
         // stack overflow
         if (thread->in_stack_yellow_reserved_zone(addr)) {
-          thread->disable_stack_yellow_reserved_zone();
           if (thread->thread_state() == _thread_in_Java) {
+            if (thread->in_stack_reserved_zone(addr)) {
+              frame fr;
+              if (os::Linux::get_frame_at_stack_banging_point(thread, uc, &fr)) {
+                assert(fr.is_java_frame(), "Must be a Javac frame");
+                frame activation =
+                  SharedRuntime::look_for_reserved_stack_annotated_method(thread, fr);
+                if (activation.sp() != NULL) {
+                  thread->disable_stack_reserved_zone();
+                  if (activation.is_interpreted_frame()) {
+                    thread->set_reserved_stack_activation((address)activation.fp());
+                  } else {
+                    thread->set_reserved_stack_activation((address)activation.unextended_sp());
+                  }
+                  return 1;
+                }
+              }
+            }
             // Throw a stack overflow exception.
             // Guard pages will be reenabled while unwinding the stack.
+            thread->disable_stack_yellow_reserved_zone();
             stub = SharedRuntime::continuation_for_implicit_exception(thread, pc, SharedRuntime::STACK_OVERFLOW);
           } else {
             // Thread was in the vm or native code. Return and try to finish.
+            thread->disable_stack_yellow_reserved_zone();
             return 1;
           }
         } else if (thread->in_stack_red_zone(addr)) {
@@ -374,7 +435,7 @@ JVM_handle_linux_signal(int sig,
         // BugId 4454115: A read from a MappedByteBuffer can fault here if the
         // underlying file has been truncated. Do not crash the VM in such a case.
         CodeBlob* cb = CodeCache::find_blob_unsafe(pc);
-        nmethod* nm = (cb != NULL && cb->is_nmethod()) ? (nmethod*)cb : NULL;
+        CompiledMethod* nm = (cb != NULL) ? cb->as_compiled_method_or_null() : NULL;
         if (nm != NULL && nm->has_unsafe_access()) {
           // We don't really need a stub here! Just set the pending exeption and
           // continue at the next instruction after the faulting read. Returning
@@ -466,101 +527,17 @@ void os::Linux::set_fpu_control_word(int fpu_control) {
 ////////////////////////////////////////////////////////////////////////////////
 // thread stack
 
-size_t os::Posix::_compiler_thread_min_stack_allowed = 128 * K;
-size_t os::Posix::_java_thread_min_stack_allowed = 128 * K;
-size_t os::Posix::_vm_internal_thread_min_stack_allowed = 128 * K;
+// Minimum usable stack sizes required to get to user code. Space for
+// HotSpot guard pages is added later.
+size_t os::Posix::_compiler_thread_min_stack_allowed = (52 DEBUG_ONLY(+ 32)) * K;
+size_t os::Posix::_java_thread_min_stack_allowed = (32 DEBUG_ONLY(+ 8)) * K;
+size_t os::Posix::_vm_internal_thread_min_stack_allowed = 32 * K;
 
-// return default stack size for thr_type
+// Return default stack size for thr_type.
 size_t os::Posix::default_stack_size(os::ThreadType thr_type) {
-  // default stack size (compiler thread needs larger stack)
+  // Default stack size (compiler thread needs larger stack).
   size_t s = (thr_type == os::compiler_thread ? 4 * M : 1024 * K);
   return s;
-}
-
-size_t os::Linux::default_guard_size(os::ThreadType thr_type) {
-  // z/Architecture: put 2 guard pages right in the middle of thread stack. This value
-  // should be consistent with the value used by register stack handling code.
-  return 2 * page_size();
-}
-
-// Java thread:
-//
-//   Low memory addresses
-//    +------------------------+
-//    |                        |\
-//    |    glibc guard page    | - Right in the middle of stack, 2 pages
-//    |                        |/
-// P1 +------------------------+ Thread::stack_base() - Thread::stack_size()
-//    |                        |\
-//    |  HotSpot Guard Pages   | - red and yellow pages
-//    |                        |/
-//    +------------------------+ JavaThread::stack_yellow_zone_base()
-//    |                        |\
-//    |      Normal Stack      | -
-//    |                        |/
-// P2 +------------------------+ Thread::stack_base()
-//
-// Non-Java thread:
-//
-//   Low memory addresses
-//    +------------------------+
-//    |                        |\
-//    |    glibc guard page    | - Right in the middle of stack, 2 pages
-//    |                        |/
-// P1 +------------------------+ Thread::stack_base() - Thread::stack_size()
-//    |                        |\
-//    |      Normal Stack      | -
-//    |                        |/
-// P2 +------------------------+ Thread::stack_base()
-//
-// ** P2 is the address returned from pthread_attr_getstackaddr(), P2 - P1
-//    is the stack size returned by pthread_attr_getstacksize().
-
-
-static void current_stack_region(address * bottom, size_t * size) {
-  if (os::Linux::is_initial_thread()) {
-    // Initial thread needs special handling because pthread_getattr_np()
-    // may return bogus value.
-    *bottom = os::Linux::initial_thread_stack_bottom();
-    *size   = os::Linux::initial_thread_stack_size();
-  } else {
-    pthread_attr_t attr;
-
-    int rslt = pthread_getattr_np(pthread_self(), &attr);
-
-    // JVM needs to know exact stack location, abort if it fails
-    if (rslt != 0) {
-      if (rslt == ENOMEM) {
-        vm_exit_out_of_memory(0, OOM_MMAP_ERROR, "pthread_getattr_np");
-      } else {
-        fatal("pthread_getattr_np failed with errno = %d", rslt);
-      }
-    }
-
-    if (pthread_attr_getstack(&attr, (void **)bottom, size) != 0) {
-      fatal("Can not locate current stack attributes!");
-    }
-
-    pthread_attr_destroy(&attr);
-
-  }
-  assert(os::current_stack_pointer() >= *bottom &&
-         os::current_stack_pointer() < *bottom + *size, "just checking");
-}
-
-address os::current_stack_base() {
-  address bottom;
-  size_t size;
-  current_stack_region(&bottom, &size);
-  return (bottom + size);
-}
-
-size_t os::current_stack_size() {
-  // stack size includes normal stack and HotSpot guard pages
-  address bottom;
-  size_t size;
-  current_stack_region(&bottom, &size);
-  return size;
 }
 
 /////////////////////////////////////////////////////////////////////////////

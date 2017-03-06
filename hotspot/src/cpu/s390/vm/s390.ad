@@ -909,15 +909,8 @@ void MachEpilogNode::emit(CodeBuffer &cbuf, PhaseRegAlloc *ra_) const {
   // If this does safepoint polling, then do it here.
   bool need_polling = do_polling() && C->is_method_compilation();
 
-  // Touch the polling page.
-  // Part 1: get the page's address.
-  if (need_polling) {
-    AddressLiteral pp(os::get_polling_page());
-    __ load_const_optimized(Z_R1_scratch, pp);
-  }
-
   // Pop frame, restore return_pc, and all stuff needed by interpreter.
-  // Pop frame by add insted of load (a penny saved is a penny got :-).
+  // Pop frame by add instead of load (a penny saved is a penny got :-).
   int frame_size_in_bytes = Assembler::align((C->frame_slots() << LogBytesPerInt), frame::alignment_in_bytes);
   int retPC_offset        = frame_size_in_bytes + _z_abi16(return_pc);
   if (Displacement::is_validDisp(retPC_offset)) {
@@ -928,9 +921,14 @@ void MachEpilogNode::emit(CodeBuffer &cbuf, PhaseRegAlloc *ra_) const {
     __ restore_return_pc();
   }
 
-  // Touch the polling page,
-  // part 2: touch the page now.
+  if (StackReservedPages > 0 && C->has_reserved_stack_access()) {
+    __ reserved_stack_check(Z_R14);
+  }
+
+  // Touch the polling page.
   if (need_polling) {
+    AddressLiteral pp(os::get_polling_page());
+    __ load_const_optimized(Z_R1_scratch, pp);
     // We need to mark the code position where the load from the safepoint
     // polling page was emitted as relocInfo::poll_return_type here.
     __ relocate(relocInfo::poll_return_type);
@@ -939,7 +937,7 @@ void MachEpilogNode::emit(CodeBuffer &cbuf, PhaseRegAlloc *ra_) const {
 }
 
 uint MachEpilogNode::size(PhaseRegAlloc *ra_) const {
-  // variable size. determine dynamically.
+  // Variable size. determine dynamically.
   return MachNode::size(ra_);
 }
 
@@ -1489,8 +1487,8 @@ const bool Matcher::match_rule_supported(int opcode) {
     case Op_CountLeadingZerosL:
     case Op_CountTrailingZerosI:
     case Op_CountTrailingZerosL:
-      // Implementation requires FLOGR instruction.
-      return UseCountLeadingZerosInstruction;
+      // Implementation requires FLOGR instruction, which is available since z9.
+      return true;
 
     case Op_ReverseBytesI:
     case Op_ReverseBytesL:
@@ -7249,6 +7247,171 @@ instruct mulD_reg_mem(regD dst, memoryRX src)%{
   ins_pipe(pipe_class_dummy);
 %}
 
+// Multiply-Accumulate
+// src1 * src2 + dst
+instruct maddF_reg_reg(regF dst, regF src1, regF src2) %{
+  match(Set dst (FmaF dst (Binary src1 src2)));
+  // CC unchanged by MUL-ADD.
+  ins_cost(ALU_REG_COST);
+  size(4);
+  format %{ "MAEBR    $dst, $src1, $src2" %}
+  ins_encode %{
+    __ z_maebr($dst$$FloatRegister, $src1$$FloatRegister, $src2$$FloatRegister);
+  %}
+  ins_pipe(pipe_class_dummy);
+%}
+
+// src1 * src2 + dst
+instruct maddD_reg_reg(regD dst, regD src1, regD src2) %{
+  match(Set dst (FmaD dst (Binary src1 src2)));
+  // CC unchanged by MUL-ADD.
+  ins_cost(ALU_REG_COST);
+  size(4);
+  format %{ "MADBR    $dst, $src1, $src2" %}
+  ins_encode %{
+    __ z_madbr($dst$$FloatRegister, $src1$$FloatRegister, $src2$$FloatRegister);
+  %}
+  ins_pipe(pipe_class_dummy);
+%}
+
+// src1 * src2 - dst
+instruct msubF_reg_reg(regF dst, regF src1, regF src2) %{
+  match(Set dst (FmaF (NegF dst) (Binary src1 src2)));
+  // CC unchanged by MUL-SUB.
+  ins_cost(ALU_REG_COST);
+  size(4);
+  format %{ "MSEBR    $dst, $src1, $src2" %}
+  ins_encode %{
+    __ z_msebr($dst$$FloatRegister, $src1$$FloatRegister, $src2$$FloatRegister);
+  %}
+  ins_pipe(pipe_class_dummy);
+%}
+
+// src1 * src2 - dst
+instruct msubD_reg_reg(regD dst, regD src1, regD src2) %{
+  match(Set dst (FmaD (NegD dst) (Binary src1 src2)));
+  // CC unchanged by MUL-SUB.
+  ins_cost(ALU_REG_COST);
+  size(4);
+  format %{ "MSDBR    $dst, $src1, $src2" %}
+  ins_encode %{
+    __ z_msdbr($dst$$FloatRegister, $src1$$FloatRegister, $src2$$FloatRegister);
+  %}
+  ins_pipe(pipe_class_dummy);
+%}
+
+// src1 * src2 + dst
+instruct maddF_reg_mem(regF dst, regF src1, memoryRX src2) %{
+  match(Set dst (FmaF dst (Binary src1 (LoadF src2))));
+  // CC unchanged by MUL-ADD.
+  ins_cost(ALU_MEMORY_COST);
+  size(6);
+  format %{ "MAEB     $dst, $src1, $src2" %}
+  ins_encode %{
+    __ z_maeb($dst$$FloatRegister, $src1$$FloatRegister,
+              Address(reg_to_register_object($src2$$base), $src2$$index$$Register, $src2$$disp));
+  %}
+  ins_pipe(pipe_class_dummy);
+%}
+
+// src1 * src2 + dst
+instruct maddD_reg_mem(regD dst, regD src1, memoryRX src2) %{
+  match(Set dst (FmaD dst (Binary src1 (LoadD src2))));
+  // CC unchanged by MUL-ADD.
+  ins_cost(ALU_MEMORY_COST);
+  size(6);
+  format %{ "MADB     $dst, $src1, $src2" %}
+  ins_encode %{
+    __ z_madb($dst$$FloatRegister, $src1$$FloatRegister,
+              Address(reg_to_register_object($src2$$base), $src2$$index$$Register, $src2$$disp));
+  %}
+  ins_pipe(pipe_class_dummy);
+%}
+
+// src1 * src2 - dst
+instruct msubF_reg_mem(regF dst, regF src1, memoryRX src2) %{
+  match(Set dst (FmaF (NegF dst) (Binary src1 (LoadF src2))));
+  // CC unchanged by MUL-SUB.
+  ins_cost(ALU_MEMORY_COST);
+  size(6);
+  format %{ "MSEB     $dst, $src1, $src2" %}
+  ins_encode %{
+    __ z_mseb($dst$$FloatRegister, $src1$$FloatRegister,
+              Address(reg_to_register_object($src2$$base), $src2$$index$$Register, $src2$$disp));
+  %}
+  ins_pipe(pipe_class_dummy);
+%}
+
+// src1 * src2 - dst
+instruct msubD_reg_mem(regD dst, regD src1, memoryRX src2) %{
+  match(Set dst (FmaD (NegD dst) (Binary src1 (LoadD src2))));
+  // CC unchanged by MUL-SUB.
+  ins_cost(ALU_MEMORY_COST);
+  size(6);
+  format %{ "MSDB    $dst, $src1, $src2" %}
+  ins_encode %{
+    __ z_msdb($dst$$FloatRegister, $src1$$FloatRegister,
+              Address(reg_to_register_object($src2$$base), $src2$$index$$Register, $src2$$disp));
+  %}
+  ins_pipe(pipe_class_dummy);
+%}
+
+// src1 * src2 + dst
+instruct maddF_mem_reg(regF dst, memoryRX src1, regF src2) %{
+  match(Set dst (FmaF dst (Binary (LoadF src1) src2)));
+  // CC unchanged by MUL-ADD.
+  ins_cost(ALU_MEMORY_COST);
+  size(6);
+  format %{ "MAEB     $dst, $src1, $src2" %}
+  ins_encode %{
+    __ z_maeb($dst$$FloatRegister, $src2$$FloatRegister,
+              Address(reg_to_register_object($src1$$base), $src1$$index$$Register, $src1$$disp));
+  %}
+  ins_pipe(pipe_class_dummy);
+%}
+
+// src1 * src2 + dst
+instruct maddD_mem_reg(regD dst, memoryRX src1, regD src2) %{
+  match(Set dst (FmaD dst (Binary (LoadD src1) src2)));
+  // CC unchanged by MUL-ADD.
+  ins_cost(ALU_MEMORY_COST);
+  size(6);
+  format %{ "MADB     $dst, $src1, $src2" %}
+  ins_encode %{
+    __ z_madb($dst$$FloatRegister, $src2$$FloatRegister,
+              Address(reg_to_register_object($src1$$base), $src1$$index$$Register, $src1$$disp));
+  %}
+  ins_pipe(pipe_class_dummy);
+%}
+
+// src1 * src2 - dst
+instruct msubF_mem_reg(regF dst, memoryRX src1, regF src2) %{
+  match(Set dst (FmaF (NegF dst) (Binary (LoadF src1) src2)));
+  // CC unchanged by MUL-SUB.
+  ins_cost(ALU_MEMORY_COST);
+  size(6);
+  format %{ "MSEB     $dst, $src1, $src2" %}
+  ins_encode %{
+    __ z_mseb($dst$$FloatRegister, $src2$$FloatRegister,
+              Address(reg_to_register_object($src1$$base), $src1$$index$$Register, $src1$$disp));
+  %}
+  ins_pipe(pipe_class_dummy);
+%}
+
+// src1 * src2 - dst
+instruct msubD_mem_reg(regD dst, memoryRX src1, regD src2) %{
+  match(Set dst (FmaD (NegD dst) (Binary (LoadD src1) src2)));
+  // CC unchanged by MUL-SUB.
+  ins_cost(ALU_MEMORY_COST);
+  size(6);
+  format %{ "MSDB    $dst, $src1, $src2" %}
+  ins_encode %{
+    __ z_msdb($dst$$FloatRegister, $src2$$FloatRegister,
+              Address(reg_to_register_object($src1$$base), $src1$$index$$Register, $src1$$disp));
+  %}
+  ins_pipe(pipe_class_dummy);
+%}
+
 //  DIV
 
 //  Div float single precision
@@ -9897,7 +10060,6 @@ instruct string_compareUL(iRegP str1, iRegP str2, rarg2RegI cnt1, rarg5RegI cnt2
 
 // String IndexOfChar
 instruct indexOfChar_U(iRegP haystack, iRegI haycnt, iRegI ch, iRegI result, roddRegL oddReg, revenRegL evenReg, flagsReg cr) %{
-  predicate(CompactStrings);
   match(Set result (StrIndexOfChar (Binary haystack haycnt) ch));
   effect(TEMP_DEF result, TEMP evenReg, TEMP oddReg, KILL cr); // R0, R1 are killed, too.
   ins_cost(200);
@@ -10590,7 +10752,6 @@ instruct bytes_reverse_long(iRegL dst, iRegL src) %{
 instruct countLeadingZerosI(revenRegI dst, iRegI src, roddRegI tmp, flagsReg cr) %{
   match(Set dst (CountLeadingZerosI src));
   effect(KILL tmp, KILL cr);
-  predicate(UseCountLeadingZerosInstruction);  // See Matcher::match_rule_supported
   ins_cost(3 * DEFAULT_COST);
   size(14);
   format %{ "SLLG    $dst,$src,32\t# no need to always count 32 zeroes first\n\t"
@@ -10629,7 +10790,6 @@ instruct countLeadingZerosI(revenRegI dst, iRegI src, roddRegI tmp, flagsReg cr)
 instruct countLeadingZerosL(revenRegI dst, iRegL src, roddRegI tmp, flagsReg cr) %{
   match(Set dst (CountLeadingZerosL src));
   effect(KILL tmp, KILL cr);
-  predicate(UseCountLeadingZerosInstruction);  // See Matcher::match_rule_supported
   ins_cost(DEFAULT_COST);
   size(4);
   format %{ "FLOGR   $dst,$src \t# count leading zeros (long)\n\t" %}
@@ -10655,7 +10815,6 @@ instruct countLeadingZerosL(revenRegI dst, iRegL src, roddRegI tmp, flagsReg cr)
 instruct countTrailingZerosI(revenRegI dst, iRegI src, roddRegI tmp, flagsReg cr) %{
   match(Set dst (CountTrailingZerosI src));
   effect(TEMP_DEF dst, TEMP tmp, KILL cr);
-  predicate(UseCountLeadingZerosInstruction);  // See Matcher::match_rule_supported
   ins_cost(8 * DEFAULT_COST);
   // TODO: s390 port size(FIXED_SIZE);  // Emitted code depends on PreferLAoverADD being on/off.
   format %{ "LLGFR   $dst,$src  \t# clear upper 32 bits (we are dealing with int)\n\t"
@@ -10709,7 +10868,6 @@ instruct countTrailingZerosI(revenRegI dst, iRegI src, roddRegI tmp, flagsReg cr
 instruct countTrailingZerosL(revenRegI dst, iRegL src, roddRegL tmp, flagsReg cr) %{
   match(Set dst (CountTrailingZerosL src));
   effect(TEMP_DEF dst, KILL tmp, KILL cr);
-  predicate(UseCountLeadingZerosInstruction);  // See Matcher::match_rule_supported
   ins_cost(8 * DEFAULT_COST);
   // TODO: s390 port size(FIXED_SIZE);  // Emitted code depends on PreferLAoverADD being on/off.
   format %{ "LCGR    $dst,$src  \t# preserve src\n\t"

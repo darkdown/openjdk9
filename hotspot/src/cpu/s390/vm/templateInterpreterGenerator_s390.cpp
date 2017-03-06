@@ -1112,16 +1112,21 @@ void TemplateInterpreterGenerator::generate_fixed_frame(bool native_call) {
   // top_frame_size = TOP_IJAVA_FRAME_ABI + max_stack + size of interpreter state
   __ add2reg(top_frame_size,
              frame::z_top_ijava_frame_abi_size +
-               frame::z_ijava_state_size +
-               frame::interpreter_frame_monitor_size() * wordSize,
+             frame::z_ijava_state_size +
+             frame::interpreter_frame_monitor_size() * wordSize,
              max_stack);
 
-  // Check if there's room for the new frame...
-  Register frame_size = max_stack; // Reuse the regiser for max_stack.
-  __ z_lgr(frame_size, Z_SP);
-  __ z_sgr(frame_size, sp_after_resize);
-  __ z_agr(frame_size, top_frame_size);
-  generate_stack_overflow_check(frame_size, fp/*tmp1*/);
+  if (!native_call) {
+    // Stack overflow check.
+    // Native calls don't need the stack size check since they have no
+    // expression stack and the arguments are already on the stack and
+    // we only add a handful of words to the stack.
+    Register frame_size = max_stack; // Reuse the regiser for max_stack.
+    __ z_lgr(frame_size, Z_SP);
+    __ z_sgr(frame_size, sp_after_resize);
+    __ z_agr(frame_size, top_frame_size);
+    generate_stack_overflow_check(frame_size, fp/*tmp1*/);
+  }
 
   DEBUG_ONLY(__ z_cg(Z_R14, _z_abi16(return_pc), Z_SP));
   __ asm_assert_eq("killed Z_R14", 0);
@@ -1297,36 +1302,96 @@ void TemplateInterpreterGenerator::generate_fixed_frame(bool native_call) {
 // Math function, frame manager must set up an interpreter state, etc.
 address TemplateInterpreterGenerator::generate_math_entry(AbstractInterpreter::MethodKind kind) {
 
-  if (!InlineIntrinsics) { return NULL; } // Generate a vanilla entry.
+  // Decide what to do: Use same platform specific instructions and runtime calls as compilers.
+  bool use_instruction = false;
+  address runtime_entry = NULL;
+  int num_args = 1;
+  bool double_precision = true;
 
-  // Only support absolute value and square root.
-  if (kind != Interpreter::java_lang_math_abs && kind != Interpreter::java_lang_math_sqrt) {
-    return NULL;
+  // s390 specific:
+  switch (kind) {
+    case Interpreter::java_lang_math_sqrt:
+    case Interpreter::java_lang_math_abs:  use_instruction = true; break;
+    case Interpreter::java_lang_math_fmaF:
+    case Interpreter::java_lang_math_fmaD: use_instruction = UseFMA; break;
+    default: break; // Fall back to runtime call.
   }
 
-  BLOCK_COMMENT("math_entry {");
+  switch (kind) {
+    case Interpreter::java_lang_math_sin  : runtime_entry = CAST_FROM_FN_PTR(address, SharedRuntime::dsin);   break;
+    case Interpreter::java_lang_math_cos  : runtime_entry = CAST_FROM_FN_PTR(address, SharedRuntime::dcos);   break;
+    case Interpreter::java_lang_math_tan  : runtime_entry = CAST_FROM_FN_PTR(address, SharedRuntime::dtan);   break;
+    case Interpreter::java_lang_math_abs  : /* run interpreted */ break;
+    case Interpreter::java_lang_math_sqrt : /* runtime_entry = CAST_FROM_FN_PTR(address, SharedRuntime::dsqrt); not available */ break;
+    case Interpreter::java_lang_math_log  : runtime_entry = CAST_FROM_FN_PTR(address, SharedRuntime::dlog);   break;
+    case Interpreter::java_lang_math_log10: runtime_entry = CAST_FROM_FN_PTR(address, SharedRuntime::dlog10); break;
+    case Interpreter::java_lang_math_pow  : runtime_entry = CAST_FROM_FN_PTR(address, SharedRuntime::dpow); num_args = 2; break;
+    case Interpreter::java_lang_math_exp  : runtime_entry = CAST_FROM_FN_PTR(address, SharedRuntime::dexp);   break;
+    case Interpreter::java_lang_math_fmaF : /* run interpreted */ num_args = 3; double_precision = false; break;
+    case Interpreter::java_lang_math_fmaD : /* run interpreted */ num_args = 3; break;
+    default: ShouldNotReachHere();
+  }
 
-  address math_entry = __ pc();
+  // Use normal entry if neither instruction nor runtime call is used.
+  if (!use_instruction && runtime_entry == NULL) return NULL;
 
-  if (kind == Interpreter::java_lang_math_abs) {
-    // Load operand from stack.
-    __ mem2freg_opt(Z_FRET, Address(Z_esp, Interpreter::stackElementSize));
-    __ z_lpdbr(Z_FRET);
+  address entry = __ pc();
+
+  if (use_instruction) {
+    switch (kind) {
+      case Interpreter::java_lang_math_sqrt:
+        // Can use memory operand directly.
+        __ z_sqdb(Z_FRET, Interpreter::stackElementSize, Z_esp);
+        break;
+      case Interpreter::java_lang_math_abs:
+        // Load operand from stack.
+        __ mem2freg_opt(Z_FRET, Address(Z_esp, Interpreter::stackElementSize));
+        __ z_lpdbr(Z_FRET);
+        break;
+      case Interpreter::java_lang_math_fmaF:
+        __ mem2freg_opt(Z_FRET,  Address(Z_esp,     Interpreter::stackElementSize)); // result reg = arg3
+        __ mem2freg_opt(Z_FARG2, Address(Z_esp, 3 * Interpreter::stackElementSize)); // arg1
+        __ z_maeb(Z_FRET, Z_FARG2, Address(Z_esp, 2 * Interpreter::stackElementSize));
+        break;
+      case Interpreter::java_lang_math_fmaD:
+        __ mem2freg_opt(Z_FRET,  Address(Z_esp,     Interpreter::stackElementSize)); // result reg = arg3
+        __ mem2freg_opt(Z_FARG2, Address(Z_esp, 5 * Interpreter::stackElementSize)); // arg1
+        __ z_madb(Z_FRET, Z_FARG2, Address(Z_esp, 3 * Interpreter::stackElementSize));
+        break;
+      default: ShouldNotReachHere();
+    }
   } else {
-    // sqrt
-    // Can use memory operand directly.
-    __ z_sqdb(Z_FRET, Interpreter::stackElementSize, Z_esp);
+    // Load arguments
+    assert(num_args <= 4, "passed in registers");
+    if (double_precision) {
+      int offset = (2 * num_args - 1) * Interpreter::stackElementSize;
+      for (int i = 0; i < num_args; ++i) {
+        __ mem2freg_opt(as_FloatRegister(Z_FARG1->encoding() + 2 * i), Address(Z_esp, offset));
+        offset -= 2 * Interpreter::stackElementSize;
+      }
+    } else {
+      int offset = num_args * Interpreter::stackElementSize;
+      for (int i = 0; i < num_args; ++i) {
+        __ mem2freg_opt(as_FloatRegister(Z_FARG1->encoding() + 2 * i), Address(Z_esp, offset));
+        offset -= Interpreter::stackElementSize;
+      }
+    }
+    // Call runtime
+    __ save_return_pc();       // Save Z_R14.
+    __ push_frame_abi160(0);   // Without new frame the RT call could overwrite the saved Z_R14.
+
+    __ call_VM_leaf(runtime_entry);
+
+    __ pop_frame();
+    __ restore_return_pc();    // Restore Z_R14.
   }
 
-  // Restore caller sp for c2i case.
+  // Pop c2i arguments (if any) off when we return.
   __ resize_frame_absolute(Z_R10, Z_R0, true); // Cut the stack back to where the caller started.
 
-  // We are done, return.
   __ z_br(Z_R14);
 
-  BLOCK_COMMENT("} math_entry");
-
-  return math_entry;
+  return entry;
 }
 
 // Interpreter stub for calling a native method. (asm interpreter).

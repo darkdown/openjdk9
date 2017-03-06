@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 1999, 2016, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012, 2016 SAP SE. All rights reserved.
+ * Copyright (c) 1999, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2017 SAP SE. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -547,11 +547,7 @@ void os::init_system_properties_values() {
     if (pslash != NULL) {
       pslash = strrchr(buf, '/');
       if (pslash != NULL) {
-        *pslash = '\0';          // Get rid of /<arch>.
-        pslash = strrchr(buf, '/');
-        if (pslash != NULL) {
-          *pslash = '\0';        // Get rid of /lib.
-        }
+        *pslash = '\0';        // Get rid of /lib.
       }
     }
     Arguments::set_java_home(buf);
@@ -636,7 +632,6 @@ void os::Aix::signal_sets_init() {
   sigaddset(&unblocked_sigs, SIGBUS);
   sigaddset(&unblocked_sigs, SIGFPE);
   sigaddset(&unblocked_sigs, SIGTRAP);
-  sigaddset(&unblocked_sigs, SIGDANGER);
   sigaddset(&unblocked_sigs, SR_signum);
 
   if (!ReduceSignalUsage) {
@@ -852,13 +847,13 @@ bool os::create_thread(Thread* thread, ThreadType thr_type,
 
   assert(thread->osthread() == NULL, "caller responsible");
 
-  // Allocate the OSThread object
+  // Allocate the OSThread object.
   OSThread* osthread = new OSThread(NULL, NULL);
   if (osthread == NULL) {
     return false;
   }
 
-  // set the correct thread state
+  // Set the correct thread state.
   osthread->set_thread_type(thr_type);
 
   // Initial state is ALLOCATED but not INITIALIZED
@@ -866,7 +861,7 @@ bool os::create_thread(Thread* thread, ThreadType thr_type,
 
   thread->set_osthread(osthread);
 
-  // init thread attributes
+  // Init thread attributes.
   pthread_attr_t attr;
   pthread_attr_init(&attr);
   guarantee(pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) == 0, "???");
@@ -875,14 +870,17 @@ bool os::create_thread(Thread* thread, ThreadType thr_type,
   if (os::Aix::on_aix()) {
     guarantee(pthread_attr_setscope(&attr, PTHREAD_SCOPE_SYSTEM) == 0, "???");
     guarantee(pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED) == 0, "???");
-  } // end: aix
+  }
 
   // Start in suspended state, and in os::thread_start, wake the thread up.
   guarantee(pthread_attr_setsuspendstate_np(&attr, PTHREAD_CREATE_SUSPENDED_NP) == 0, "???");
 
-  // calculate stack size if it's not specified by caller
+  // Calculate stack size if it's not specified by caller.
   size_t stack_size = os::Posix::get_initial_stack_size(thr_type, req_stack_size);
   pthread_attr_setstacksize(&attr, stack_size);
+
+  // Configure libc guard page.
+  pthread_attr_setguardsize(&attr, os::Aix::default_guard_size(thr_type));
 
   pthread_t tid;
   int ret = pthread_create(&tid, &attr, (void* (*)(void*)) thread_native_entry, thread);
@@ -899,7 +897,7 @@ bool os::create_thread(Thread* thread, ThreadType thr_type,
   pthread_attr_destroy(&attr);
 
   if (ret != 0) {
-    // Need to clean up stuff we've allocated so far
+    // Need to clean up stuff we've allocated so far.
     thread->set_osthread(NULL);
     delete osthread;
     return false;
@@ -1554,6 +1552,8 @@ void os::print_signal_handlers(outputStream* st, char* buf, size_t buflen) {
   print_signal_handler(st, SHUTDOWN3_SIGNAL , buf, buflen);
   print_signal_handler(st, BREAK_SIGNAL, buf, buflen);
   print_signal_handler(st, SIGTRAP, buf, buflen);
+  // We also want to know if someone else adds a SIGDANGER handler because
+  // that will interfere with OOM killling.
   print_signal_handler(st, SIGDANGER, buf, buflen);
 }
 
@@ -3036,6 +3036,19 @@ bool os::Aix::chained_handler(int sig, siginfo_t* siginfo, void* context) {
   return chained;
 }
 
+size_t os::Aix::default_guard_size(os::ThreadType thr_type) {
+  // Creating guard page is very expensive. Java thread has HotSpot
+  // guard pages, only enable glibc guard page for non-Java threads.
+  // (Remember: compiler thread is a Java thread, too!)
+  //
+  // Aix can have different page sizes for stack (4K) and heap (64K).
+  // As Hotspot knows only one page size, we assume the stack has
+  // the same page size as the heap. Returning page_size() here can
+  // cause 16 guard pages which we want to avoid.  Thus we return 4K
+  // which will be rounded to the real page size by the OS.
+  return ((thr_type == java_thread || thr_type == compiler_thread) ? 0 : 4 * K);
+}
+
 struct sigaction* os::Aix::get_preinstalled_handler(int sig) {
   if (sigismember(&sigs, sig)) {
     return &sigact[sig];
@@ -3144,7 +3157,6 @@ void os::Aix::install_signal_handlers() {
     set_signal_handler(SIGFPE, true);
     set_signal_handler(SIGTRAP, true);
     set_signal_handler(SIGXFSZ, true);
-    set_signal_handler(SIGDANGER, true);
 
     if (libjsig_is_loaded) {
       // Tell libjsig jvm finishes setting signal handlers.
@@ -3261,7 +3273,6 @@ void os::run_periodic_checks() {
   if (UseSIGTRAP) {
     DO_SIGNAL_CHECK(SIGTRAP);
   }
-  DO_SIGNAL_CHECK(SIGDANGER);
 
   // ReduceSignalUsage allows the user to override these handlers
   // see comments at the very top and jvm_solaris.h
